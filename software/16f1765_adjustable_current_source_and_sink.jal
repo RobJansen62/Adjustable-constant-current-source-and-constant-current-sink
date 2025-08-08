@@ -1,0 +1,1086 @@
+; ==============================================================================
+; Title: Adjustable Current Source and Current Sink with timers.
+; Author: Rob Jansen, Copyright (c) 2025..2025, all rights reserved.
+; Compiler: 2.5r9
+;
+; Revision:
+; 2025-07-04 : Initial version. 
+; 2025-08-02 : Added current sink function.
+; 2025-08-08 : Added mAh measurement when discharging.
+;
+; Description: An adjustable current source and current sink including a timer
+;              function. The source current and sink current and their timers
+;              can be set independently of each other using an SSD1306 Display.
+;              Currents up to 1 Ampere can be set. The timers can be switched 
+;              off (default) and can be set in hours up to 24 hours.
+;              A calibration function is available using 1 Ampere as reference. 
+;              An auto switch off function is activated if the set current 
+;              cannot be sourced or cannot be sinked. 
+;              All user settings are stored in High Endurance Flash and are
+;              recovered when the device is powered up.
+;
+;===============================================================================
+
+include 16f1765 
+
+; This uses the 8 MHz internal oscillator, which is fast enough.
+pragma target clock 8_000_000          ; Oscillator frequency 8 MHz
+
+; Configuration memory settings (fuses). 
+pragma target OSC      INTOSC_NOCLKOUT ; Internal Clock
+pragma target PLLEN    DISABLED        ; PLL off
+pragma target WDT      DISABLED        ; No Watchdog
+pragma target PWRTE    ENABLED         ; Power up timer enabled
+pragma target BROWNOUT DISABLED        ; No brownout reset
+pragma target FCMEN    DISABLED        ; No clock monitoring
+pragma target IESO     DISABLED        ; int/ext osc. switch
+pragma target LVP      ENABLED         ; Low voltage programming
+pragma target MCLR     INTERNAL        ; Reset internal
+OSCCON_IRCF   = 0b1110                 ; Set 8 MHz.
+OSCCON_SCS    = 0b00                   ; Clock determined by FOSC.
+
+; Enable weak pull up. Only for input pins with some exceptions, see below.
+WPUA = 0b0000_0011 ; AN2 used for ADC input so do not use pull up.     
+WPUC = 0b0011_1011 ; Pull up for SCL and SDA. Allowed since PIC runs at 3.3V.
+OPTION_REG_WPUEN = FALSE  
+
+; Make all pins digital I/O
+enable_digital_io()
+; Take some time to stabilize.
+_usec_delay(250_000)
+
+; ================================= Pins ======================================
+
+; Set IIC default pins.
+include pps
+pps_control_lock(FALSE)                
+RC0PPS = PPS_SCK  ; IIC SDL to C0  (default).          
+RC1PPS = PPS_SDA  ; IIC SDA to C1  (default).    
+pps_control_lock(TRUE)                 
+
+; Setting for IIC libray to prevent hang-up in case something goes wrong.
+const word I2C_HARDWARE_TIMEOUT = 10_000 -- At least 10 ms to prevent hang-up.
+
+; Define the pins for the SSD1306. In this case we define it for IIC.
+alias ssd1306_sck is pin_C0 -- Pin 10 for 14 pin DIP.
+alias ssd1306_sck_direction is pin_C0_direction
+alias ssd1306_sdo is pin_C1 -- Pin 9 for 14 pin DIP.
+alias ssd1306_sdo_direction is pin_C1_direction 
+
+; The output of the opamp connected to the DAC is on pin_C2.
+
+; Define the pins for the switches (keys). Active LOW.
+alias key_up is pin_C5
+pin_C5_direction = INPUT
+alias key_down is pin_C4
+pin_C4_direction = INPUT
+alias key_enter is pin_C3
+pin_C3_direction = INPUT
+
+; LEDs, active high. The pin for the sink LED is also used to switch the
+; output of the device to current sink (default is source), using a Relay.
+alias source_led is pin_A4
+pin_a4_direction = OUTPUT
+alias sink_led is pin_A5
+pin_a5_direction = OUTPUT
+
+; =========================== Peripheral Setup =================================
+
+; Since this PIC does not have more than 1024 bytes of data memory so we use
+; the text only mode.
+const SSD1306_TEXT_ONLY = TRUE
+
+; Font libraries.
+include glcd_6x8_font
+include glcd_font
+
+; Include SSD1306 library. This will also initialize the IIC interface when
+; the library is initialized.
+include glcd_ssd1306
+include print
+
+; Set fixed voltage reference. Since the used measuring resistor is 1 Ohm,
+; the maximum Voltage is 1 Volt so we use the 1.024 Volt reference Voltage
+; for maximum ADC resolution. In order to limit the maximum current the
+; DAC is connected to the 2.048 reference voltage. 
+FVRCON_CDAFVR = 0b10 ; 2.048 Volt for DAC. Used to limit the max current.
+FVRCON_ADFVR  = 0b01 ; 1.024 Volt for ADC for 1 Ohm resistor and 1 Ampere.
+FVRCON_FVREN  = TRUE ; Enable FVR
+
+; Use the operational amplifier to buffer de output of the DAC so it can
+; drive the transistor directly..
+OPA1PCHS_PCH = 0b0010 ; Set positive input to DAC output.
+OPA1CON_UG = TRUE ; OPA output connected to inverting input.
+pin_C2_direction =  OUTPUT ; OPA out is pin C2
+OPA1CON_EN = TRUE ; Enable OPA.
+
+; Setup ADC. Analog input pin setup, we wil use channel 2.
+const byte ADC_CHANNEL = 2
+pin_AN2_direction = INPUT
+ANSELA_ANSA2 = TRUE 
+; Set the interal FVR as VREF+ and GND for VREF- With FVR 1.024 Volt one
+; ADC step will be 1 mV (1.024 V / 1024 steps for 10-bit ADC.)
+ADCON1_ADPREF = 0b11
+ADCON1_ADNREF = FALSE
+; Use Fosc/32 as ADC clock this gives a 2 us conversion time at 16 MHz.
+ADCON1_ADCS = 0b010 
+; Set external impedance to 1k.
+const word ADC_RSOURCE = 1_000
+; Now we can include the JAL ADC library.
+include adc
+
+; Initialize the DAC.
+DAC1REF = 0 ; No voltage on DAC output.
+DACLD_DAC1LD = TRUE ; Tranfer data to load buffer.
+DAC1CON0_FM = FALSE ; Right justified.
+DAC1CON0_PSS = 0b10 ; Use FVR as VREF+.
+DAC1CON0_NSS = FALSE ; Use GND as VREF-.
+DAC1CON0_OE = FALSE ; Disable DAC output (connected to OPA).
+DAC1CON0_EN = TRUE ; Enable DAC.
+
+-- High Endurance Flash (HEF) address declarations to store user settings.
+const HEF_NR_OF_BYTES    = 128
+const HEF_ADDRESS_OFFSET = 8192 - HEF_NR_OF_BYTES
+include pic_data_hef
+
+; ========================== Constant declarations ============================
+; Timer 1 value for generating a 1 second timer signal.
+const word TIMER1_RELOAD = 65_536 - 10_000 ; Gives 100 Hz with 1 MHz input.
+const byte ONE_SECOND_TIMEOUT = 100 ; 100 Hz / 100 = 1 second
+
+; Minimum and maximum valuea for the 10-bit ADC and 10-bit DAC. The MAX_ADC
+; value is to protect that the Voltage on the ADC input becomes too high.
+; The MAX_DAC value is used to automatically switch off the current when the
+; load disconnects. 
+const word MIN_ADC = 0
+const word MAX_ADC = 1023
+const word MIN_DAC = 0
+const word MAX_DAC = 1023 
+
+; The resistor of 1 Ohm is not accurate so we need a factor that we obtain
+; during calibration. We know that the 10-bit (1024 steps) uses the reference
+; voltage of 1.024 Volt so each ADC step is about 1 mV.
+; Since calibration using 1 Ampere will not exactly give 1 Volt a calibration
+; value could just as wel be 1.1 or 0.9. We do not use floats but use dword 
+; insted by using a calculation based on a multiplication factor of 1000.
+const dword ADC_TO_MA_MUTIPLICATION  = 1_000
+const dword THOUSAND_MA              = 1_000
+
+; Initial current values expressed in ADC values.
+const word MIN_CURRENT  = 0
+const word DEFAULT_SET_CURRENT = 100  ; ADC value. 100 mA.
+const word DEFAULT_MAX_CURRENT = 1000 ; ADC value. 1000 mA before calibration.
+
+; LED constants.
+const bit LED_ON  = HIGH
+const bit LED_OFF = LOW
+
+; Text constants for SSD1306.
+const bit TEXT_NORMAL  = FALSE
+const bit TEXT_INVERSE = TRUE 
+
+; Blank string to erase character at the end of a value.
+const byte BLANK_STRING_2[] = "  "   ; Two spaces.
+const byte BLANK_STRING_3[] = "   "  ; Three spaces.
+
+; Used text. H is used for text in the 2-line header. N is used for normal text.
+; First line is always the same for all menus.
+const byte TEXT_TOP_H1[] = "Adjustable Current"
+; General x-coordinate for top text.
+const byte X_TOP_H1 = 8
+
+; General y-coordinates.
+const byte Y_H1 = 0
+const byte Y_H2 = 1
+const byte Y_N1 = 2
+const byte Y_N2 = 3
+const byte Y_N3 = 4
+const byte Y_N4 = 5
+const byte Y_N5 = 6
+const byte Y_N6 = 7
+
+; Main Menu.
+const byte TEXT_MAIN_H2[] = "Main Menu"
+const byte TEXT_MAIN_N1[] = "Current Source Menu"
+const byte TEXT_MAIN_N2[] = "Current Sink Menu"
+const byte TEXT_MAIN_N3[] = "Calibration Menu"
+const byte TEXT_MAIN_N5[] = "Capacity (mAh):"
+; Used coordinates for each used text.
+const byte X_MAIN_H2 = 35
+const byte X_MAIN_N1 = 10
+const byte X_MAIN_N2 = 17
+const byte X_MAIN_N3 = 20
+const byte X_MAIN_N5 = 0
+; Used coordinates for values. Used for mAh. 
+const byte X_MAIN_VALUE_N5 = X_MAIN_N5 + 93
+
+; Source Menu. Also used as Sink Menu.
+const byte TEXT_SOURCE_H2[]  = "Current Source Menu"
+const byte TEXT_SOURCE_N1[]  = "Current (mA) :"
+const byte TEXT_SOURCE_N2[]  = "Timer (hours):"
+const byte TEXT_SOURCE_N3A[] = "START"
+const byte TEXT_SOURCE_N3B[] = "STARTED"
+const byte TEXT_SOURCE_N4[]  = "Return to Main Menu"
+const byte TEXT_SOURCE_N5[]  = "<Press ENTER to stop>"
+; Used coordinates for each used text.
+const byte X_SOURCE_H2  = 5
+const byte X_SOURCE_N1  = 3
+const byte X_SOURCE_N2  = 3
+const byte X_SOURCE_N3A = 50
+const byte X_SOURCE_N3B = 44
+const byte X_SOURCE_N4  = 5
+const byte X_SOURCE_N5  = 0
+; Used coordinates for values.
+const byte X_SOURCE_VALUE_N1 = X_SOURCE_N1 + 87
+const byte X_SOURCE_VALUE_N2 = X_SOURCE_N2 + 87
+
+; Sink Menu. Uses the same as the Source Menu except the first line.
+const byte TEXT_SINK_H2[] = "Current Sink Menu"
+; Used coordinates for each used text.
+const byte X_SINK_H2 = 11
+
+; Calibration Menu. 
+const byte TEXT_CALIBRATION_H2[] = "Calibration Menu"
+const byte TEXT_CALIBRATION_N1[] = "Current (1A):"
+const byte TEXT_CALIBRATION_N2[] = "Return to Main Menu"
+; Used coordinates for each used text.
+const byte X_CALIBRATION_H2 = 5
+const byte X_CALIBRATION_N1 = 5
+const byte X_CALIBRATION_N2 = 0
+; Used coordinates for values.
+const byte X_CALIBRATION_VALUE_N1 = X_CALIBRATION_N1 + 85
+
+; Menu selection constants.
+; Main menu.
+const byte SELECTION_MAIN_SOURCE      = 0
+const byte SELECTION_MAIN_SINK        = 1
+const byte SELECTION_MAIN_CALIBRATION = 2
+; Source Menu. Also used for the Sink Menu.
+const byte SELECTION_SOURCE_CURRENT = 0
+const byte SELECTION_SOURCE_TIMER   = 1
+const byte SELECTION_SOURCE_START   = 2
+const byte SELECTION_SOURCE_MAIN    = 3
+; Calibration menu.
+const byte SELECTION_CALIBRATION_MAX_CURRENT = 0
+const byte SELECTION_CALIBRATION_MAIN        = 1
+
+; KEY constants.
+const byte UP_KEY    = 0
+const byte DOWN_KEY  = 1
+const byte ENTER_KEY = 2
+const word KEY_DEBOUNCE = 50_000 ; 50 ms.
+; Keys are active low.
+const bit KEY_PRESSED  = LOW
+const bit KEY_RELEASED = HIGH
+
+; Timer constants in hours.
+const byte MIN_TIMER = 0 ; Means no timer set.
+const byte MAX_TIMER = 24
+
+; High Endurance Flash address offset. Current are in ADC values.
+const word HEF_ADDRESS_1A_CURRENT     = 0 ; ADC value. Size word. 
+const word HEF_ADDRESS_SOURCE_CURRENT = 2 ; ADC value. Size word.
+const word HEF_ADDRESS_SINK_CURRENT   = 4 ; ADC value. Size word.
+const word HEF_ADDRESS_SOURCE_TIMER   = 6 ; Size byte.
+const word HEF_ADDRESS_SINK_TIMER     = 7 ; Size byte.
+
+; ========================== Variable declarations ============================
+var dword timer_counter, mah_counter ; Seconds
+var word adc_to_ma_factor, value_adc, value_dac
+var word source_current, sink_current, max_current, current_set ; ADC values!
+var byte source_timer, sink_timer, one_second_timer
+var byte menu_selection, key
+var bit sourcing ; When TRUE we are sourcing otherwise we are sinking.
+var bit active, time_passed, debug_activated
+
+; ========================= Functions and Procedures ==========================
+
+; Initialize Timer 1. Used to generate a 1 second signal. Timer is not started.
+procedure timer1_init() is
+
+   T1CON_ON = FALSE
+   T1CON_CS = 0b00 ; Use Fosc/4 --> 2 MHz
+   T1CON_CKPS = 0b01 ; Prescaler 2 --> 1 MHz
+   TMR1 = TIMER1_RELOAD ; 1 MHz / 10_000 = 100 Hz
+   one_second_timer = ONE_SECOND_TIMEOUT
+   mah_counter = 0
+   time_passed = FALSE
+   ; Enable required interrupts.
+   PIR1_TMR1IF = FALSE
+   PIE1_TMR1IE = TRUE
+   INTCON_GIE = TRUE
+   INTCON_PEIE = TRUE
+
+end procedure
+
+
+; Timer interrupt. Lowers the user timer counter. If time is passed, sets the 
+; global variable 'time_passed' flag and stops the timer. 
+procedure timer1() is
+   pragma interrupt
+
+   if PIR1_TMR1IF then
+      PIR1_TMR1IF = FALSE
+      TMR1 = TIMER1_RELOAD
+      one_second_timer = one_second_timer - 1
+      if (one_second_timer == 0) then
+         one_second_timer = ONE_SECOND_TIMEOUT
+         ; Timer counter holds the user set time in seconds.
+         timer_counter = timer_counter - 1
+         ; In case of discharge, keep track of time for mAh calculation.
+         if !sourcing then
+            mah_counter = mah_counter + 1
+         end if 
+         if (timer_counter == 0) then
+            time_passed = TRUE
+            T1CON_ON = FALSE
+         end if 
+      end if 
+   end if 
+
+end procedure
+
+
+; Sets the timer to the given hours and starts the timer. The time itself is 
+; measured in seconds. When a value of 0 is given, the timer is not set and 
+; the timer is stopped.
+procedure set_timer(byte in hours)  is
+
+   T1CON_ON = FALSE
+   time_passed = FALSE
+   mah_counter = 0 ; Used for mAh calculation when discharging.
+   if (hours != 0) then
+      PIR1_TMR1IF = FALSE
+      TMR1 = TIMER1_RELOAD
+      one_second_timer = ONE_SECOND_TIMEOUT
+      timer_counter = 3600 * dword(hours) ; Hours to seconds.
+      T1CON_ON = TRUE
+   end if
+
+end procedure
+
+
+; Stop the timer.
+procedure stop_timer() is
+
+   T1CON_ON = FALSE
+   time_passed = FALSE
+
+end procedure
+
+
+; Set the DAC to the given value.
+procedure set_dac(word in value) is
+
+   DAC1REF = value
+   DACLD_DAC1LD = TRUE ; Tranfer data to load buffer.
+   while DACLD_DAC1LD loop
+      ; Wait for DAC to complete the transfer.
+   end loop
+
+end procedure
+
+
+; Wait the key debounce time.
+procedure debounce() is
+
+   _usec_delay(KEY_DEBOUNCE)
+
+end procedure
+
+
+; Check if all keys are released. Return TRUE if all released.
+function all_keys_relased() return bit is
+   
+   return (key_up == KEY_RELEASED) & (key_down == KEY_RELEASED) &
+          (key_enter == KEY_RELEASED)
+
+end function
+
+
+; Wait for all keys to be released.
+procedure wait_for_key_release() is
+
+   debounce()
+   while !all_keys_relased() loop
+      debounce()
+   end loop 
+
+end procedure
+
+
+; Check if a key is pressed. Return TRUE and the key when pressed.
+function get_key(byte out pressed_key) return bit is
+
+   var bit pressed = FALSE
+
+   if (key_up == KEY_PRESSED) then
+      debounce()
+      if (key_up == KEY_PRESSED) then
+         pressed_key = UP_KEY
+         pressed = TRUE
+      end if 
+   elsif (key_down == KEY_PRESSED) then
+       debounce()
+      if (key_down == KEY_PRESSED) then
+         pressed_key = DOWN_KEY
+         pressed = TRUE
+      end if 
+   elsif (key_enter == KEY_PRESSED) then
+      debounce()
+      if (key_enter == KEY_PRESSED) then
+         pressed_key = ENTER_KEY
+         pressed = TRUE
+      end if 
+   end if 
+
+   return pressed
+
+end function
+
+
+; Get the calculation factor needed to convert an adc value to mA. The input
+; must be the ADC value at 1 Ampere (1000 mA).
+function get_calculation_factor(word in adc_1000_ma) return word is
+
+   var dword calculation
+
+   calculation = (THOUSAND_MA * ADC_TO_MA_MUTIPLICATION) / dword(adc_1000_ma)
+   return word(calculation)
+
+end function
+
+
+; Calculation to convert an ADC value to a current in mA. The global variable
+; 'adc_to_ma_factor' is used for this calculation. 
+function adc_to_ma(word in adc_value) return word is
+
+   ; Instead of using floats we use a multiplication so that we can used (d)word.
+   var dword calculation
+ 
+   calculation = dword(adc_value) * dword(adc_to_ma_factor)
+   calculation = calculation / ADC_TO_MA_MUTIPLICATION
+
+   return word(calculation)
+
+end function
+
+
+; Write the given byte value to the SSD1306 at the given location. Value can be
+; display in normal or inverse mode.
+procedure write_byte(byte in value, byte in x_coordindate, 
+                     byte in y_coordindate, bit in inverse) is
+
+   if (inverse == TEXT_INVERSE) then
+      glcd_background_color = GLCD_BLACK
+   else
+      glcd_background_color = GLCD_WHITE
+   end if 
+   ssd1306_goto(x_coordindate, y_coordindate)
+   print_byte_dec(glcd, value)
+
+end procedure
+
+
+; Write the given word value to the SSD1306 at the given location. Value can be
+; display in normal or inverse mode.
+procedure write_word(word in value, byte in x_coordindate, 
+                     byte in y_coordindate, bit in inverse) is
+
+   if (inverse == TEXT_INVERSE) then
+      glcd_background_color = GLCD_BLACK
+   else
+      glcd_background_color = GLCD_WHITE
+   end if 
+   ssd1306_goto(x_coordindate, y_coordindate)
+   print_word_dec(glcd, value)
+
+end procedure
+
+
+; Write the given text to the GLCD at the given location. Text can be
+; display in normal or inverse mode.
+procedure write_text(byte in text[], byte in x_coordindate, 
+                    byte in y_coordindate, bit in inverse) is
+
+   if (inverse == TEXT_INVERSE) then
+      glcd_background_color = GLCD_BLACK
+   else
+      glcd_background_color = GLCD_WHITE
+   end if 
+   ssd1306_goto(x_coordindate, y_coordindate)
+   print_string(glcd, text)
+
+end procedure
+
+
+; Get the user settings. If they are available in the HEF we use them,
+; otherwise we use default settings. The current settings are ADC values
+; and are copied to the global variables 'max_current', 'source_current',
+; 'sink_current', 'source_timer' and 'sink_timer'.
+procedure get_user_settings() is
+
+   ; Get user values from HEF. An empty HEF location contains 0xFF.
+   ; Calibrated 1 Ampere ADC value.
+   if (data_hef_word(HEF_ADDRESS_1A_CURRENT) > MAX_ADC) then
+      max_current = DEFAULT_MAX_CURRENT 
+   else
+      max_current = data_hef_word(HEF_ADDRESS_1A_CURRENT)
+   end if 
+   ; Source current.
+   if (data_hef_word(HEF_ADDRESS_SOURCE_CURRENT) > MAX_ADC) then
+      source_current = DEFAULT_SET_CURRENT
+   else
+      source_current = data_hef_word(HEF_ADDRESS_SOURCE_CURRENT)
+      ; Note, max_current is initialized before. 
+      if (source_current > max_current) then
+         ; Not allowed, use default.
+         source_current = DEFAULT_SET_CURRENT
+      end if 
+   end if 
+   ; Sink current.
+   if (data_hef_word(HEF_ADDRESS_SINK_CURRENT) > MAX_ADC) then
+      sink_current = DEFAULT_SET_CURRENT
+   else
+      sink_current = data_hef_word(HEF_ADDRESS_SINK_CURRENT)
+      ; Note, max_current is initialized before. 
+      if (sink_current > max_current) then
+         ; Not allowed, use default.
+         sink_current = DEFAULT_SET_CURRENT
+      end if 
+   end if 
+   ; Source timer.
+   if (data_hef(HEF_ADDRESS_SOURCE_TIMER) > MAX_TIMER) then
+      source_timer = MIN_TIMER
+   else
+      source_timer = data_hef(HEF_ADDRESS_SOURCE_TIMER)
+   end if 
+   ; Sink timer.
+   if (data_hef(HEF_ADDRESS_SINK_TIMER) > MAX_TIMER) then
+      sink_timer = MIN_TIMER
+   else
+      sink_timer = data_hef(HEF_ADDRESS_SINK_TIMER)
+   end if 
+
+end procedure
+
+
+; Handle the main menu and return the selection. When 'show_capacity'
+; is TRUE it will show the discharge capacity.
+function main_menu() return byte is
+
+   var dword calculation
+   var byte menu_key
+   var byte selection = SELECTION_MAIN_SOURCE
+   var bit done = FALSE
+
+   ssd1306_clear_screen()
+   ; Write header.
+   write_text(TEXT_TOP_H1, X_TOP_H1, Y_H1, TEXT_NORMAL)
+   write_text(TEXT_MAIN_H2, X_MAIN_H2, Y_H2, TEXT_NORMAL)
+
+   while !done loop
+      ; Write content
+      write_text(TEXT_MAIN_N1, X_MAIN_N1, Y_N1, TEXT_NORMAL)
+      write_text(TEXT_MAIN_N2, X_MAIN_N2, Y_N2, TEXT_NORMAL)
+      write_text(TEXT_MAIN_N3, X_MAIN_N3, Y_N3, TEXT_NORMAL)
+      if (mah_counter != 0) then
+         ; We where discharging show capacity.
+         write_text(TEXT_MAIN_N5, X_MAIN_N5, Y_N5, TEXT_NORMAL)
+         calculation = dword(adc_to_ma(current_set)) * mah_counter
+         ; Express in mAh.
+         calculation = calculation / 3600
+         write_word(word(calculation), X_MAIN_VALUE_N5, Y_N5, TEXT_NORMAL)
+      end if 
+
+      ; Write the updated selection.
+      case selection of
+
+         SELECTION_MAIN_SOURCE:
+         block
+            write_text(TEXT_MAIN_N1, X_MAIN_N1, Y_N1, TEXT_INVERSE)
+         end block
+
+         SELECTION_MAIN_SINK:
+         block
+            write_text(TEXT_MAIN_N2, X_MAIN_N2, Y_N2, TEXT_INVERSE)
+         end block
+
+         SELECTION_MAIN_CALIBRATION:
+         block
+            write_text(TEXT_MAIN_N3, X_MAIN_N3, Y_N3, TEXT_INVERSE)
+         end block
+
+      end case
+      
+      ; Wait for a key to be pressed.
+      while !get_key(menu_key) loop
+         ; Wait for it.
+      end loop
+      wait_for_key_release()
+
+      if (menu_key == UP_KEY) then
+         case selection of
+            SELECTION_MAIN_SOURCE: selection = SELECTION_MAIN_CALIBRATION
+            SELECTION_MAIN_SINK: selection = SELECTION_MAIN_SOURCE
+            SELECTION_MAIN_CALIBRATION: selection = SELECTION_MAIN_SINK
+         end case
+      elsif (menu_key == DOWN_KEY) then
+         case selection of
+            SELECTION_MAIN_SOURCE: selection = SELECTION_MAIN_SINK
+            SELECTION_MAIN_SINK: selection = SELECTION_MAIN_CALIBRATION
+            SELECTION_MAIN_CALIBRATION: selection = SELECTION_MAIN_SOURCE
+         end case
+      else
+         ; Enter key pressed.
+         done = TRUE
+      end if 
+
+   end loop
+   
+   return selection
+
+end function
+
+
+; Handle the Source Menu or Sink Menu. This procedure uses and modifies 
+; the global variables 'source_current', 'sink_current', 'source_timer' 
+; and 'sink_timer'. New values will be stored in HEF.
+procedure source_sink_menu(bit in source_menu) is
+
+   var word current 
+   var byte menu_key, timer
+   var byte selection = SELECTION_SOURCE_CURRENT
+   var bit done = FALSE
+   var bit enter_value = FALSE
+
+   ssd1306_clear_screen()
+   ; Write header.
+   write_text(TEXT_TOP_H1, X_TOP_H1, Y_H1, TEXT_NORMAL)
+   ; Type of menu depends on parameter.
+   if source_menu then
+      current = source_current
+      timer = source_timer
+      write_text(TEXT_SOURCE_H2, X_SOURCE_H2, Y_H2, TEXT_NORMAL)
+   else
+      current = sink_current
+      timer = sink_timer
+      write_text(TEXT_SINK_H2, X_SINK_H2, Y_H2, TEXT_NORMAL)
+   end if 
+   ; We need to write the values at least ones. It is done before the rest but
+   ; that should not be visible.
+   write_word(adc_to_ma(current), X_SOURCE_VALUE_N1, Y_N1, TEXT_NORMAL)
+   write_byte(timer, X_SOURCE_VALUE_N2, Y_N2, TEXT_NORMAL)
+
+   while !done loop
+      ; Write content, menu items.
+      write_text(TEXT_SOURCE_N1, X_SOURCE_N1, Y_N1, TEXT_NORMAL)
+      write_text(TEXT_SOURCE_N2, X_SOURCE_N2, Y_N2, TEXT_NORMAL)
+      write_text(TEXT_SOURCE_N3A, X_SOURCE_N3A, Y_N3, TEXT_NORMAL)
+      write_text(TEXT_SOURCE_N4, X_SOURCE_N4, Y_N4, TEXT_NORMAL)
+
+      ; Write the updated selection.
+      case selection of
+
+         SELECTION_SOURCE_CURRENT:
+         block
+            if enter_value then
+               write_word(adc_to_ma(current), X_SOURCE_VALUE_N1, Y_N1, TEXT_INVERSE)
+               glcd_background_color = GLCD_WHITE
+               print_string(glcd, BLANK_STRING_2)
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  if (current < max_current) then
+                     current = current + 1
+                  end if 
+               elsif (menu_key == DOWN_KEY) then
+                  if (current > MIN_CURRENT) then
+                     current = current - 1
+                  end if 
+               else
+                  ; Enter key pressed. 
+                  enter_value = FALSE
+                  wait_for_key_release()
+               end if
+            else 
+               write_word(adc_to_ma(current), X_SOURCE_VALUE_N1, Y_N1, TEXT_NORMAL)
+               print_string(glcd, BLANK_STRING_2)
+               write_text(TEXT_SOURCE_N1, X_SOURCE_N1, Y_N1, TEXT_INVERSE)
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  selection = SELECTION_SOURCE_MAIN
+               elsif (menu_key == DOWN_KEY) then
+                  selection = SELECTION_SOURCE_TIMER
+               else
+                  ; Enter key pressed. 
+                  enter_value = TRUE
+               end if 
+               wait_for_key_release()
+            end if 
+         end block
+
+         SELECTION_SOURCE_TIMER:
+         block
+            if enter_value then
+               write_byte(timer, X_SOURCE_VALUE_N2, Y_N2, TEXT_INVERSE)
+               glcd_background_color = GLCD_WHITE
+               print_string(glcd, BLANK_STRING_2)
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  if (timer < MAX_TIMER) then
+                     timer = timer + 1
+                  end if 
+               elsif (menu_key == DOWN_KEY) then
+                  if (timer > MIN_TIMER) then
+                     timer = timer - 1
+                  end if 
+               else
+                  ; Enter key pressed. 
+                  enter_value = FALSE
+               end if
+            else 
+               write_byte(timer, X_SOURCE_VALUE_N2, Y_N2, TEXT_NORMAL)
+               print_string(glcd, BLANK_STRING_2)
+               write_text(TEXT_SOURCE_N2, X_SOURCE_N2, Y_N2, TEXT_INVERSE)
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  selection = SELECTION_SOURCE_CURRENT
+               elsif (menu_key == DOWN_KEY) then
+                  selection = SELECTION_SOURCE_START
+               else
+                  ; Enter key pressed. 
+                  enter_value = TRUE
+               end if 
+            end if 
+               wait_for_key_release()
+         end block
+
+         SELECTION_SOURCE_START:
+         block
+            write_text(TEXT_SOURCE_N3A, X_SOURCE_N3A, Y_N3, TEXT_INVERSE)
+            while !get_key(menu_key) loop end loop
+            if (menu_key == UP_KEY) then
+               selection = SELECTION_SOURCE_TIMER
+            elsif (menu_key == DOWN_KEY) then
+               selection = SELECTION_SOURCE_MAIN
+            else
+               ; Enter key pressed. Started.
+               write_text(TEXT_SOURCE_N3B, X_SOURCE_N3B, Y_N3, TEXT_NORMAL)
+               ; We overwrite the 'Return to main Menu' message when START
+               ; is pressed, so text 5 is at location 4. Highlight in inverse.
+               write_text(TEXT_SOURCE_N5, X_SOURCE_N5, Y_N4, TEXT_INVERSE)
+               set_timer(timer)
+               active = TRUE
+               done = TRUE
+            end if 
+            wait_for_key_release()
+         end block
+
+         SELECTION_SOURCE_MAIN:
+         block
+            write_text(TEXT_SOURCE_N4, X_SOURCE_N4, Y_N4, TEXT_INVERSE)
+            while !get_key(menu_key) loop end loop
+            if (menu_key == UP_KEY) then
+               selection = SELECTION_SOURCE_START
+            elsif (menu_key == DOWN_KEY) then
+               selection = SELECTION_SOURCE_CURRENT
+            else
+               ; Enter key pressed. Start
+               done = TRUE
+            end if 
+            wait_for_key_release()
+         end block
+
+      end case
+ 
+   end loop
+   ; Store the new settings in HEF if changed.
+   if source_menu then
+      if (current != source_current) then
+         source_current = current
+         data_hef_write_word(HEF_ADDRESS_SOURCE_CURRENT, source_current)
+      end if 
+      if (timer != source_timer) then
+         source_timer = timer 
+         data_hef_write(HEF_ADDRESS_SOURCE_TIMER, source_timer)
+      end if 
+   else
+      if (current != sink_current) then
+         sink_current = current
+         data_hef_write_word(HEF_ADDRESS_SINK_CURRENT, sink_current)
+      end if 
+      if (timer != sink_timer) then
+         sink_timer = timer
+         data_hef_write(HEF_ADDRESS_SINK_TIMER, sink_timer)
+      end if 
+   end if 
+
+end procedure
+
+
+; Handle the calibration menu. This procedure modifies the global variable
+; 'max_current' and stores it in HEF.
+procedure calibration_menu() is
+
+   var word adc, dac, current
+   var byte menu_key
+   var byte selection = SELECTION_CALIBRATION_MAX_CURRENT
+   var bit done = FALSE
+   var bit enter_value = FALSE
+   var bit current_reached = FALSE
+
+   dac = MIN_DAC
+   set_dac(dac)
+   adc = MIN_ADC
+   source_led = LED_OFF
+   sink_led = LED_OFF
+   ssd1306_clear_screen()
+   current = max_current
+   ; Write header.
+   write_text(TEXT_TOP_H1, X_TOP_H1, Y_H1, TEXT_NORMAL)
+   write_text(TEXT_CALIBRATION_H2, X_CALIBRATION_H2, Y_H2, TEXT_NORMAL)
+
+   while !done loop
+      ; Write content, menu items.
+      write_text(TEXT_CALIBRATION_N1, X_CALIBRATION_N1, Y_N1, TEXT_NORMAL)
+      write_text(TEXT_CALIBRATION_N2, X_CALIBRATION_N2, Y_N2, TEXT_NORMAL)
+      write_word(adc, X_CALIBRATION_VALUE_N1, Y_N1, TEXT_NORMAL)
+
+      ; Write the updated selection.
+      case selection of
+
+
+         SELECTION_CALIBRATION_MAX_CURRENT:
+         block
+            ; Calibrate at 1 Ampere.
+            if enter_value then
+               source_led = LED_ON
+               ; We need set ADC value to the 'max_current' once, after that
+               ; we skip this loop.
+               while !current_reached & (adc < MAX_ADC) & (dac < MAX_DAC) loop
+                  dac = dac + 1
+                  set_dac(dac)
+                  _usec_delay(1_000) ; Settle time.
+                  adc = adc_read_high_res(ADC_CHANNEL)
+                  current_reached = (adc >= current)
+               end loop
+
+               ; Now continue with the calibration cycle.
+               set_dac(dac)
+               _usec_delay(1_000) ; Settle time.
+               adc = adc_read_high_res(ADC_CHANNEL)
+               write_word(adc, X_CALIBRATION_VALUE_N1, Y_N1, TEXT_INVERSE)
+               glcd_background_color = GLCD_WHITE
+               print_string(glcd, BLANK_STRING_3)
+
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  if (adc < MAX_ADC) & (dac < MAX_DAC) then
+                     dac = dac + 1
+                  end if 
+               elsif (menu_key == DOWN_KEY) then
+                  if (adc > MIN_ADC) & (dac > MIN_DAC) then
+                     dac = dac - 1
+                  end if 
+               else
+                  ; Enter key pressed. 
+                  enter_value = FALSE
+                  source_led = LED_OFF
+                  current = adc
+                  adc_to_ma_factor = get_calculation_factor(current)
+                  ; Reset for possible next run (pressing enter again).
+                  current_reached = FALSE
+                  adc = MIN_DAC
+                  dac = MIN_DAC
+                  set_dac(MIN_DAC)
+                  wait_for_key_release()
+               end if
+            else 
+               print_string(glcd, BLANK_STRING_3)
+               write_text(TEXT_CALIBRATION_N1, X_CALIBRATION_N1, Y_N1, TEXT_INVERSE)
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) | (menu_key == DOWN_KEY) then
+                  selection = SELECTION_CALIBRATION_MAIN
+               else
+                  ; Enter key pressed. 
+                  enter_value = TRUE
+               end if 
+               wait_for_key_release()
+            end if 
+         end block
+
+         SELECTION_CALIBRATION_MAIN:
+         block
+            write_text(TEXT_CALIBRATION_N2, X_CALIBRATION_N2, Y_N2, TEXT_INVERSE)
+            while !get_key(menu_key) loop end loop
+            if (menu_key == UP_KEY) | (menu_key == DOWN_KEY) then
+               selection = SELECTION_CALIBRATION_MAX_CURRENT
+            else
+               ; Enter key pressed.
+               done = TRUE
+            end if 
+            wait_for_key_release()
+         end block
+
+      end case
+ 
+   end loop
+   set_dac(MIN_DAC)
+   source_led = LED_OFF
+   ; Store the new settings in HEF if changed.
+   if (current != max_current) then
+      max_current = current
+      data_hef_write_word(HEF_ADDRESS_1A_CURRENT, max_current)
+   end if 
+
+end procedure
+
+
+; Reset output, that is set the DAC to 0, stop the timer and put off the LEDs.
+procedure reset_output() is
+
+   source_led = LED_OFF
+   sink_led = LED_OFF
+   active = FALSE
+   stop_timer()
+   value_dac = 0
+   set_dac(value_dac)
+
+end procedure
+
+
+; For debugging only. Print stationary debug info.
+procedure print_debug_stationairy() is
+
+   ssd1306_clear_screen()
+   write_text("Debug Info", X_TOP_H1 + 5, Y_H1, TEXT_NORMAL)
+   write_text("Current (mA):", 0, Y_N1, TEXT_NORMAL)
+   print_word_dec(glcd, adc_to_ma(current_set))
+   write_text("Set value is:", 0, Y_N3, TEXT_NORMAL)
+   print_word_dec(glcd, current_set)
+   write_text("ADC value is:", 0, Y_N4, TEXT_NORMAL)
+   write_text("DAC value is:", 0, Y_N5, TEXT_NORMAL)
+   write_text("MA factor is:", 0, Y_N6, TEXT_NORMAL)
+   print_word_dec(glcd, adc_to_ma_factor)
+ end procedure
+
+
+; For debugging only. Print variable debug info.
+procedure print_debug_variable() is
+
+   ; Align variable data with stationary data.
+   const byte X_COORD = 78
+
+   ssd1306_goto(X_COORD, Y_N4)
+   print_word_dec(glcd, value_adc)
+   glcd = " "
+   glcd = " "
+   ssd1306_goto(X_COORD, Y_N5)
+   print_word_dec(glcd, value_dac)
+   glcd = " "
+   glcd = " "
+      
+end procedure
+
+
+; ========================= Main program starts here ==========================
+; Initialize libraries.
+ssd1306_init()
+adc_init()
+timer1_init()
+
+; First check for debug mode. ENTER Key must be pressed at power up.
+debug_activated = FALSE
+if get_key(key) then
+   if (key == ENTER_KEY) then
+      debug_activated = TRUE
+      wait_for_key_release()
+   end if 
+end if 
+
+; Maximize the contract for the display.
+ssd1306_set_contrast(0xFF)
+
+; User settings, if present, are stored in HEF.
+get_user_settings()
+; We assume that the default is sourcing.
+sourcing = TRUE
+current_set = source_current
+; After we have 'max_current' we can set the calculation factor.
+adc_to_ma_factor = get_calculation_factor(max_current)
+
+; Used this for testing purposes, now commented out.
+; dac_test()
+
+glcd_font_use(FONT_6X8)
+
+forever loop 
+
+   reset_output()
+
+   ; Wait for the selection from the main manu.
+   menu_selection = main_menu()
+   if (menu_selection == SELECTION_MAIN_SOURCE) then
+      sourcing = TRUE
+      source_sink_menu(sourcing)
+      current_set = source_current
+      sink_led = LED_OFF
+      source_led = LED_ON
+   elsif (menu_selection == SELECTION_MAIN_SINK) then
+      sourcing = FALSE
+      source_sink_menu(sourcing)
+      current_set = sink_current
+      source_led = LED_OFF
+      sink_led = LED_ON
+   else 
+      calibration_menu()
+   end if 
+
+   ; If debug active, overwrite the menu screen.
+   if debug_activated then
+      print_debug_stationairy()
+   end if 
+  
+   ; This runs if all goes well and when time is not passed (if applicable).
+   while active & !time_passed loop   
+      ; Loop time is 1 ms.
+      _usec_delay(1_000) 
+
+      ; Measure the voltage over the load resistor using channel 2.
+      value_adc = adc_read_high_res(ADC_CHANNEL)
+
+      if debug_activated then
+         ; Note, the makes the control loop slower so it takes more
+         ; time before the current is set.
+         print_debug_variable() 
+      end if 
+ 
+      ; If the measurement does not equal the current set, adjust.
+      if (value_adc < current_set) & (value_adc < MAX_ADC) & 
+         (value_dac < MAX_DAC) then
+         ; Increase current.
+         value_dac = value_dac + 1
+         set_dac(value_dac)
+      elsif (value_adc > current_set) & (value_dac > 0) then
+         ; Decrease current.
+         value_dac = value_dac - 1
+         set_dac(value_dac)
+      elsif  (value_adc >= MAX_ADC) | (value_dac == MAX_DAC) then
+         ; Auto off works both for source (in case of nothing connected)
+         ; as well as for sink (if we cannot draw enough current).
+         ; The DAC value will then reach MAX_DAC, the MAX_ADC is
+         ; just there for safety.
+         active = FALSE 
+      end if 
+
+      ; Check for ENTER key pressed. This will stop the current
+      ; activity.
+      if get_key(key) then
+         if (key == ENTER_KEY) then
+            active = FALSE
+         end if 
+      end if 
+
+   end loop 
+
+end loop
