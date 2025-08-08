@@ -6,7 +6,7 @@
 ; Revision:
 ; 2025-07-04 : Initial version. 
 ; 2025-08-02 : Added current sink function.
-; 2025-08-08 : Added mAh measurement when discharging.
+; 2025-08-08 : Added mAh measurement.
 ;
 ; Description: An adjustable current source and current sink including a timer
 ;              function. The source current and sink current and their timers
@@ -327,10 +327,8 @@ procedure timer1() is
          one_second_timer = ONE_SECOND_TIMEOUT
          ; Timer counter holds the user set time in seconds.
          timer_counter = timer_counter - 1
-         ; In case of discharge, keep track of time for mAh calculation.
-         if !sourcing then
-            mah_counter = mah_counter + 1
-         end if 
+         ; Keep track of time for mAh calculation.
+         mah_counter = mah_counter + 1
          if (timer_counter == 0) then
             time_passed = TRUE
             T1CON_ON = FALSE
