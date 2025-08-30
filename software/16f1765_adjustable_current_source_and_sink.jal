@@ -7,6 +7,7 @@
 ; 2025-07-04 : Initial version. 
 ; 2025-08-02 : Added current sink function.
 ; 2025-08-08 : Added mAh measurement.
+; 2025-08-22 : Added watchdog and 'SAVE' option for calibration.
 ;
 ; Description: An adjustable current source and current sink including a timer
 ;              function. The source current and sink current and their timers
@@ -29,7 +30,7 @@ pragma target clock 8_000_000          ; Oscillator frequency 8 MHz
 ; Configuration memory settings (fuses). 
 pragma target OSC      INTOSC_NOCLKOUT ; Internal Clock
 pragma target PLLEN    DISABLED        ; PLL off
-pragma target WDT      DISABLED        ; No Watchdog
+pragma target WDT      CONTROL         ; Watchdog controlled by software.
 pragma target PWRTE    ENABLED         ; Power up timer enabled
 pragma target BROWNOUT DISABLED        ; No brownout reset
 pragma target FCMEN    DISABLED        ; No clock monitoring
@@ -204,15 +205,17 @@ const byte TEXT_MAIN_H2[] = "Main Menu"
 const byte TEXT_MAIN_N1[] = "Current Source Menu"
 const byte TEXT_MAIN_N2[] = "Current Sink Menu"
 const byte TEXT_MAIN_N3[] = "Calibration Menu"
-const byte TEXT_MAIN_N5[] = "Capacity (mAh):"
+const byte TEXT_MAIN_N5A[] = "Capacity (mAh):"
+const byte TEXT_MAIN_N5B[] = "Device Reset"
 ; Used coordinates for each used text.
 const byte X_MAIN_H2 = 35
 const byte X_MAIN_N1 = 10
 const byte X_MAIN_N2 = 17
 const byte X_MAIN_N3 = 20
-const byte X_MAIN_N5 = 0
+const byte X_MAIN_N5A = 0
+const byte X_MAIN_N5B = 35
 ; Used coordinates for values. Used for mAh. 
-const byte X_MAIN_VALUE_N5 = X_MAIN_N5 + 93
+const byte X_MAIN_VALUE_N5 = X_MAIN_N5A + 93
 
 ; Source Menu. Also used as Sink Menu.
 const byte TEXT_SOURCE_H2[]  = "Current Source Menu"
@@ -240,13 +243,16 @@ const byte TEXT_SINK_H2[] = "Current Sink Menu"
 const byte X_SINK_H2 = 11
 
 ; Calibration Menu. 
-const byte TEXT_CALIBRATION_H2[] = "Calibration Menu"
-const byte TEXT_CALIBRATION_N1[] = "Current (1A):"
-const byte TEXT_CALIBRATION_N2[] = "Return to Main Menu"
+const byte TEXT_CALIBRATION_H2[]  = "Calibration Menu"
+const byte TEXT_CALIBRATION_N1[]  = "Current (1A):"
+const byte TEXT_CALIBRATION_N2A[] = "SAVE"
+const byte TEXT_CALIBRATION_N2B[] = "SAVED"
+const byte TEXT_CALIBRATION_N3[]  = "Return to Main Menu"
 ; Used coordinates for each used text.
 const byte X_CALIBRATION_H2 = 5
 const byte X_CALIBRATION_N1 = 5
-const byte X_CALIBRATION_N2 = 0
+const byte X_CALIBRATION_N2 = 50
+const byte X_CALIBRATION_N3 = 0
 ; Used coordinates for values.
 const byte X_CALIBRATION_VALUE_N1 = X_CALIBRATION_N1 + 85
 
@@ -262,7 +268,8 @@ const byte SELECTION_SOURCE_START   = 2
 const byte SELECTION_SOURCE_MAIN    = 3
 ; Calibration menu.
 const byte SELECTION_CALIBRATION_MAX_CURRENT = 0
-const byte SELECTION_CALIBRATION_MAIN        = 1
+const byte SELECTION_CALIBRATION_SAVE        = 1
+const byte SELECTION_CALIBRATION_MAIN        = 2
 
 ; KEY constants.
 const byte UP_KEY    = 0
@@ -291,7 +298,7 @@ var word source_current, sink_current, max_current, current_set ; ADC values!
 var byte source_timer, sink_timer, one_second_timer
 var byte menu_selection, key
 var bit sourcing ; When TRUE we are sourcing otherwise we are sinking.
-var bit active, time_passed, debug_activated
+var bit active, time_passed, debug_activated, device_reset
 
 ; ========================= Functions and Procedures ==========================
 
@@ -365,6 +372,40 @@ procedure stop_timer() is
    time_passed = FALSE
 
 end procedure
+
+
+; Initialize the watchdog. Watchdog is not active.
+procedure watchdog_init() is
+
+   WDTCON_WDTPS = 0b00111 ; WDT time 128 ms.
+   WDTCON_SWDTEN = FALSE  ; WDT disabled.
+
+end procedure
+
+
+; Enable the watchdog.
+procedure watchdog_enable() is
+
+   WDTCON_SWDTEN = TRUE
+
+end procedure
+
+
+; Disable the watchdog.
+procedure watchdog_disable() is
+
+   WDTCON_SWDTEN = FALSE
+
+end procedure
+
+
+; Kick the watchdog so it will not go off.
+procedure watchdog_kick() is
+
+   asm clrwdt
+
+end procedure
+
 
 
 ; Set the DAC to the given value.
@@ -582,9 +623,14 @@ function main_menu() return byte is
       write_text(TEXT_MAIN_N1, X_MAIN_N1, Y_N1, TEXT_NORMAL)
       write_text(TEXT_MAIN_N2, X_MAIN_N2, Y_N2, TEXT_NORMAL)
       write_text(TEXT_MAIN_N3, X_MAIN_N3, Y_N3, TEXT_NORMAL)
-      if (mah_counter != 0) then
-         ; We where discharging show capacity.
-         write_text(TEXT_MAIN_N5, X_MAIN_N5, Y_N5, TEXT_NORMAL)
+
+      ; Add some extra info if available.
+      if device_reset then
+         ; Show the message that the device was reset.
+         write_text(TEXT_MAIN_N5B, X_MAIN_N5B, Y_N5, TEXT_NORMAL)
+      elsif (mah_counter != 0) then
+         ; Timer was used, show the capacity in mAh.
+         write_text(TEXT_MAIN_N5A, X_MAIN_N5A, Y_N5, TEXT_NORMAL)
          calculation = dword(adc_to_ma(current_set)) * mah_counter
          ; Express in mAh.
          calculation = calculation / 3600
@@ -841,7 +887,8 @@ procedure calibration_menu() is
    while !done loop
       ; Write content, menu items.
       write_text(TEXT_CALIBRATION_N1, X_CALIBRATION_N1, Y_N1, TEXT_NORMAL)
-      write_text(TEXT_CALIBRATION_N2, X_CALIBRATION_N2, Y_N2, TEXT_NORMAL)
+      write_text(TEXT_CALIBRATION_N2A, X_CALIBRATION_N2, Y_N2, TEXT_NORMAL)
+      write_text(TEXT_CALIBRATION_N3, X_CALIBRATION_N3, Y_N3, TEXT_NORMAL)
       write_word(adc, X_CALIBRATION_VALUE_N1, Y_N1, TEXT_NORMAL)
 
       ; Write the updated selection.
@@ -897,8 +944,10 @@ procedure calibration_menu() is
                print_string(glcd, BLANK_STRING_3)
                write_text(TEXT_CALIBRATION_N1, X_CALIBRATION_N1, Y_N1, TEXT_INVERSE)
                while !get_key(menu_key) loop end loop
-               if (menu_key == UP_KEY) | (menu_key == DOWN_KEY) then
+               if (menu_key == UP_KEY) then
                   selection = SELECTION_CALIBRATION_MAIN
+               elsif (menu_key == DOWN_KEY) then
+                  selection = SELECTION_CALIBRATION_SAVE
                else
                   ; Enter key pressed. 
                   enter_value = TRUE
@@ -907,11 +956,44 @@ procedure calibration_menu() is
             end if 
          end block
 
+         SELECTION_CALIBRATION_SAVE:
+         block
+            write_text(TEXT_CALIBRATION_N2A, X_CALIBRATION_N2, Y_N2, TEXT_INVERSE)
+            ; Erase the last letter from the word 'SAVED'
+            glcd_background_color = GLCD_WHITE
+            glcd = " "
+            if enter_value then
+               ; Save the setting if changed. Write 'SAVED'
+               if (current != max_current) then
+                  max_current = current
+                  data_hef_write_word(HEF_ADDRESS_1A_CURRENT, max_current)
+               end if 
+               ; Show 'SAVED' for 5 seconds and restore.
+               write_text(TEXT_CALIBRATION_N2B, X_CALIBRATION_N2, Y_N2, TEXT_NORMAL)
+               _usec_delay(500_000)
+               enter_value = FALSE ; Done
+            else
+               ; Selection mode. 
+               while !get_key(menu_key) loop end loop
+               if (menu_key == UP_KEY) then
+                  selection = SELECTION_CALIBRATION_MAX_CURRENT
+               elsif (menu_key == DOWN_KEY) then
+                  selection = SELECTION_CALIBRATION_MAIN
+               else
+                  ; Enter key pressed, which mean save this value.
+                  enter_value = TRUE
+               end if 
+            end if 
+            wait_for_key_release()
+         end block
+
          SELECTION_CALIBRATION_MAIN:
          block
-            write_text(TEXT_CALIBRATION_N2, X_CALIBRATION_N2, Y_N2, TEXT_INVERSE)
+            write_text(TEXT_CALIBRATION_N3, X_CALIBRATION_N3, Y_N3, TEXT_INVERSE)
             while !get_key(menu_key) loop end loop
-            if (menu_key == UP_KEY) | (menu_key == DOWN_KEY) then
+            if (menu_key == UP_KEY) then
+               selection = SELECTION_CALIBRATION_SAVE
+            elsif (menu_key == DOWN_KEY) then
                selection = SELECTION_CALIBRATION_MAX_CURRENT
             else
                ; Enter key pressed.
@@ -925,12 +1007,6 @@ procedure calibration_menu() is
    end loop
    set_dac(MIN_DAC)
    source_led = LED_OFF
-   ; Store the new settings in HEF if changed.
-   if (current != max_current) then
-      max_current = current
-      data_hef_write_word(HEF_ADDRESS_1A_CURRENT, max_current)
-   end if 
-
 end procedure
 
 
@@ -986,6 +1062,7 @@ end procedure
 ssd1306_init()
 adc_init()
 timer1_init()
+watchdog_init()
 
 ; First check for debug mode. ENTER Key must be pressed at power up.
 debug_activated = FALSE
@@ -995,6 +1072,9 @@ if get_key(key) then
       wait_for_key_release()
    end if 
 end if 
+
+; Device was reset. Will be shown in the main menu only once.
+device_reset = TRUE
 
 ; Maximize the contract for the display.
 ssd1306_set_contrast(0xFF)
@@ -1016,6 +1096,9 @@ forever loop
 
    reset_output()
 
+   ; Waiting for menu so dog has to be muted.
+   watchdog_disable() 
+
    ; Wait for the selection from the main manu.
    menu_selection = main_menu()
    if (menu_selection == SELECTION_MAIN_SOURCE) then
@@ -1034,15 +1117,28 @@ forever loop
       calibration_menu()
    end if 
 
+   ; After the first display of the main menu we can indicate that the device 
+   ; is not started from reset so that message is no longer displayed.
+   device_reset = FALSE
+
    ; If debug active, overwrite the menu screen.
    if debug_activated then
       print_debug_stationairy()
    end if 
-  
+
+   ; If the device was activated in the menu, also activate the watchdog.
+   if active then
+      watchdog_enable()
+   end if 
+   
    ; This runs if all goes well and when time is not passed (if applicable).
-   while active & !time_passed loop   
+   while active & !time_passed loop  
+
       ; Loop time is 1 ms.
       _usec_delay(1_000) 
+
+      ; Keep the dog quiet.
+      watchdog_kick()
 
       ; Measure the voltage over the load resistor using channel 2.
       value_adc = adc_read_high_res(ADC_CHANNEL)
